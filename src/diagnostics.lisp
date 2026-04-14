@@ -116,7 +116,7 @@ Returns the file-position of the first non-whitespace, non-comment character."
 Returns (line . col) or NIL."
   (handler-case
       (with-input-from-string (stream text)
-        (let ((form-count 0))
+        (let ((form-count 0))ou switch 
           (loop
             ;; Skip whitespace and comments to find actual form start
             (let ((pos (skip-whitespace-and-comments stream)))
@@ -420,7 +420,9 @@ Returns a list of LSP Diagnostic JSON objects."
            "textDocument/publishDiagnostics"
            (make-json-object
             "uri" uri
-            "diagnostics" diagnostics))))
+            "diagnostics" (if (null diagnostics)
+                              (json-empty-array)
+                              diagnostics)))))
     (write-lsp-message notification *lsp-output*)))
 
 (defun run-diagnostics (uri)
