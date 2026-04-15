@@ -144,14 +144,37 @@ Returns (line . col) or NIL."
                 (incf form-count))))))
     (error () nil)))
 
+(defun read-into-nth-subform (stream idx)
+  "With STREAM at or before the opening paren of a list form, position STREAM
+at the start of the IDX-th element (0-indexed) within that list.
+Returns the file-position of the IDX-th sub-form, or NIL if not found."
+  (handler-case
+      (progn
+        ;; Skip whitespace to the opening paren
+        (peek-char t stream nil nil)
+        (let ((c (peek-char nil stream nil nil)))
+          (unless (and c (char= c #\())
+            (return-from read-into-nth-subform nil)))
+        (read-char stream) ; consume (
+        ;; Skip IDX sub-forms
+        (dotimes (i idx)
+          (let ((sub (read stream nil :eof)))
+            (when (eq sub :eof)
+              (return-from read-into-nth-subform nil))))
+        ;; Skip whitespace to the IDX-th sub-form
+        (peek-char t stream nil nil)
+        (file-position stream))
+    (error () nil)))
+
 (defun navigate-source-path (text form-idx sub-indices)
   "Find the precise source position indicated by FORM-IDX and SUB-INDICES.
-First locates the FORM-IDX-th top-level form, then descends into sub-forms
-following each index in SUB-INDICES.
+Locates the FORM-IDX-th top-level form, then descends into sub-forms following
+each index in SUB-INDICES using stream file-positions. This avoids both
+(length list) on dotted pairs and princ-to-string ambiguity for repeated forms.
 Returns (line . col) or NIL."
   (handler-case
       (with-input-from-string (stream text)
-        ;; Advance to the Nth top-level form
+        ;; Advance to the target top-level form, recording its start position
         (let ((form-start nil))
           (dotimes (i (1+ form-idx))
             (skip-whitespace-and-comments stream)
@@ -160,29 +183,22 @@ Returns (line . col) or NIL."
                 (when (eq form :eof) (return-from navigate-source-path nil))
                 (when (= i form-idx)
                   (setf form-start pos)))))
-          ;; If no sub-indices, return the top-level form start
-          (when (or (null sub-indices) (null form-start))
+          (unless form-start
+            (return-from navigate-source-path nil))
+          ;; No sub-indices: return position of the top-level form itself
+          (when (null sub-indices)
             (return-from navigate-source-path
-              (when form-start (offset-to-line-col text (min form-start (length text))))))
-          ;; Re-read from form-start with source positions
-          (file-position stream form-start)
-          (let ((form (read stream nil :eof)))
-            (when (eq form :eof) (return-from navigate-source-path nil))
-            ;; Navigate into sub-forms following the index path
-            (let ((current form))
-              (dolist (idx sub-indices)
-                (unless (and (listp current) (integerp idx) (< idx (length current)))
+              (offset-to-line-col text (min form-start (length text)))))
+          ;; Descend into sub-forms by tracking stream file-positions
+          (let ((current-pos form-start))
+            (dolist (idx sub-indices)
+              (file-position stream current-pos)
+              (let ((sub-pos (read-into-nth-subform stream idx)))
+                (unless sub-pos
                   (return-from navigate-source-path
                     (offset-to-line-col text (min form-start (length text)))))
-                (setf current (nth idx current)))
-              ;; Now find the position of CURRENT within the top-level form text
-              (let* ((form-text (subseq text form-start
-                                        (min (file-position stream) (length text))))
-                     (target (string-downcase (princ-to-string current)))
-                     (rel-pos (search target (string-downcase form-text))))
-                (if rel-pos
-                    (offset-to-line-col text (+ form-start rel-pos))
-                    (offset-to-line-col text (min form-start (length text)))))))))
+                (setf current-pos sub-pos)))
+            (offset-to-line-col text (min current-pos (length text))))))
     (error () nil)))
 
 (defun extract-position-from-condition (condition text)
@@ -243,8 +259,10 @@ Returns (line . col) or NIL."
        (when groups (aref groups 0))))))
 
 (defun position-in-comment-or-string-p (text offset)
-  "Return T if OFFSET in TEXT falls inside a line comment, block comment, or string literal.
-Scans from the beginning of TEXT, tracking reader state."
+  "Return T if OFFSET in TEXT falls inside a line comment, block comment, string
+literal, or pipe-escaped symbol (|...|).
+Handles #\\x character literals to avoid false positives from #\\; etc.
+Note: #; (read-time suppress) is not handled and is a known limitation."
   (let ((i 0)
         (len (length text))
         (in-string nil)
@@ -258,40 +276,58 @@ Scans from the beginning of TEXT, tracking reader state."
                     (escape (setf escape nil))
                     ((char= c #\\) (setf escape t))
                     ((char= c #\") (setf in-string nil))))
-                 ;; Block comment: #| ... |#  (nestable)
-                 ((and (char= c #\#)
-                       (< (1+ i) len)
-                       (char= (char text (1+ i)) #\|))
-                  (incf i 2) ; consume #|
-                  (let ((depth 1))
-                    (loop while (and (< i offset) (> depth 0))
-                          do (cond
-                               ((and (char= (char text i) #\#)
-                                     (< (1+ i) len)
-                                     (char= (char text (1+ i)) #\|))
-                                (incf depth) (incf i 2))
-                               ((and (char= (char text i) #\|)
-                                     (< (1+ i) len)
-                                     (char= (char text (1+ i)) #\#))
-                                (decf depth) (incf i 2))
-                               (t (incf i))))
-                    ;; If we hit OFFSET while still inside the block comment, it's a comment
-                    (when (> depth 0) (return-from position-in-comment-or-string-p t)))
-                  (decf i)) ; loop will incf below
+                 ;; Dispatching macros starting with #
+                 ((char= c #\#)
+                  (let ((next (and (< (1+ i) len) (char text (1+ i)))))
+                    (cond
+                      ;; #| ... |# nestable block comment
+                      ((and next (char= next #\|))
+                       (incf i 2) ; consume #|
+                       (let ((depth 1))
+                         (loop while (and (< i offset) (> depth 0))
+                               do (cond
+                                    ((and (char= (char text i) #\#)
+                                          (< (1+ i) len)
+                                          (char= (char text (1+ i)) #\|))
+                                     (incf depth) (incf i 2))
+                                    ((and (char= (char text i) #\|)
+                                          (< (1+ i) len)
+                                          (char= (char text (1+ i)) #\#))
+                                     (decf depth) (incf i 2))
+                                    (t (incf i))))
+                         (when (> depth 0)
+                           (return-from position-in-comment-or-string-p t)))
+                       (decf i)) ; outer loop will incf
+                      ;; #\x character literal: consume #, \, and one char (total 3)
+                      ((and next (char= next #\\))
+                       (incf i 2)) ; consume #\ and the literal char; outer incf passes it
+                      ;; Other # forms: let the outer loop advance normally
+                      (t nil))))
+                 ;; Pipe-escaped symbol: |...| — treat interior as non-code
+                 ((char= c #\|)
+                  (incf i) ; consume opening |
+                  (loop
+                    (when (>= i offset)
+                      (return-from position-in-comment-or-string-p t))
+                    (when (>= i len) (return))
+                    (let ((pc (char text i)))
+                      (cond
+                        ((char= pc #\\) (incf i 2)) ; escaped char inside pipes
+                        ((char= pc #\|) (return))   ; end of pipe symbol
+                        (t (incf i)))))
+                  ;; i now points to closing | (or ran past len); decf so outer incf passes it
+                  (decf i))
                  ;; Line comment: ; ... \n
                  ((char= c #\;)
-                  ;; Everything from here to end-of-line is a comment;
-                  ;; if offset is in this range, it's inside a comment
                   (let ((eol (or (position #\Newline text :start i) len)))
                     (when (< offset eol)
                       (return-from position-in-comment-or-string-p t))
-                    ;; Skip to the newline
                     (setf i eol)
-                    (decf i))) ; loop will incf below
+                    (decf i))) ; outer loop will incf
                  ;; String open
                  ((char= c #\") (setf in-string t))))
              (incf i))
-    ;; If we ended inside a string literal, the offset is inside it
+    ;; If we ended still inside a string literal, the offset is inside it
     in-string))
 
 (defun find-symbol-position-in-text (text symbol-name)
@@ -308,9 +344,14 @@ Returns (line . col) or NIL."
         (let ((found (search target downcased :start2 pos)))
           (unless found (return nil))
           ;; Word-boundary check: chars immediately outside the match must not
-          ;; be symbol constituents.
+          ;; be symbol constituents, except that ':' and '#' are valid left
+          ;; boundaries because they are package/uninterned prefixes (pkg::foo,
+          ;; pkg:foo, #:foo) — not continuations of a different symbol name.
           (let ((left-ok  (or (zerop found)
-                              (not (symbol-char-p (char text (1- found))))))
+                              (let ((lc (char text (1- found))))
+                                (or (not (symbol-char-p lc))
+                                    (char= lc #\:)
+                                    (char= lc #\#)))))
                 (right-ok (or (>= (+ found tlen) tlen-text)
                               (not (symbol-char-p (char text (+ found tlen)))))))
             (when (and left-ok right-ok
