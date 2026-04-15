@@ -40,37 +40,51 @@
 
 ;;; --- Source location extraction from SBCL compiler internals ---
 
+(defun extract-source-path-position (text)
+  "Extract a precise source position from SBCL's source-path data when available.
+Source-paths are set on IR nodes and encode the exact form path.
+Returns (line . col) or NIL."
+  (when (and (boundp 'sb-c::*compiler-error-context*)
+             (symbol-value 'sb-c::*compiler-error-context*))
+    (let ((ctx (symbol-value 'sb-c::*compiler-error-context*)))
+      (when (ignore-errors (slot-boundp ctx 'sb-c::source-path))
+        (let ((sp (ignore-errors (slot-value ctx 'sb-c::source-path))))
+          (when (and sp (listp sp))
+            (extract-position-from-source-path sp text)))))))
+
 (defun extract-compiler-context-position (text)
   "Extract source position from SBCL's *compiler-error-context*.
+Tries source-path first (precise), then file-position (form-level only).
 Returns (line . col) or NIL."
   (when (and (boundp 'sb-c::*compiler-error-context*)
              (symbol-value 'sb-c::*compiler-error-context*))
     (let ((ctx (symbol-value 'sb-c::*compiler-error-context*)))
       (or
-       ;; COMPILER-ERROR-CONTEXT has FILE-POSITION (byte offset)
+       ;; Source-path: precise sub-form position (IR nodes only)
+       (when (ignore-errors (slot-boundp ctx 'sb-c::source-path))
+         (let ((sp (ignore-errors (slot-value ctx 'sb-c::source-path))))
+           (when (and sp (listp sp))
+             (extract-position-from-source-path sp text))))
+       ;; File-position: position after reading the enclosing top-level form.
+       ;; Rough — points to the form boundary, not the exact error site.
        (when (typep ctx 'sb-c::compiler-error-context)
          (let ((fpos (ignore-errors
                        (slot-value ctx 'sb-c::file-position))))
            (when (and fpos (integerp fpos) (> fpos 0))
-             (offset-to-line-col text (min fpos (length text))))))
-       ;; IR nodes (COMBINATION, BIND, etc.) have SOURCE-PATH
-       ;; containing (ORIGINAL-SOURCE-START form-idx subform...)
-       (when (ignore-errors (slot-boundp ctx 'sb-c::source-path))
-         (let ((sp (ignore-errors (slot-value ctx 'sb-c::source-path))))
-           (when (and sp (listp sp))
-             (extract-position-from-source-path sp text))))))))
+             (offset-to-line-col text (min fpos (length text))))))))))
+
 
 (defun extract-position-from-source-path (source-path text)
   "Convert an SBCL source-path to (line . col).
-SOURCE-PATH is like (ORIGINAL-SOURCE-START form-idx subform-idx ...)."
-  ;; Find ORIGINAL-SOURCE-START marker and get the top-level form index
+SOURCE-PATH is like (ORIGINAL-SOURCE-START form-idx subform-idx ...) where
+each index after the top-level form index navigates into a nested sub-form."
   (let ((oss-pos (position 'sb-c::original-source-start source-path)))
     (when oss-pos
       (let* ((indices (subseq source-path (1+ oss-pos)))
-             (form-idx (first indices)))
+             (form-idx (first indices))
+             (sub-indices (rest indices)))
         (when (and form-idx (integerp form-idx))
-          ;; Find the start position of the nth top-level form
-          (find-nth-toplevel-form-position text form-idx))))))
+          (navigate-source-path text form-idx sub-indices))))))
 
 (defun skip-whitespace-and-comments (stream)
   "Advance STREAM past whitespace and line comments.
@@ -116,7 +130,7 @@ Returns the file-position of the first non-whitespace, non-comment character."
 Returns (line . col) or NIL."
   (handler-case
       (with-input-from-string (stream text)
-        (let ((form-count 0))ou switch 
+        (let ((form-count 0))
           (loop
             ;; Skip whitespace and comments to find actual form start
             (let ((pos (skip-whitespace-and-comments stream)))
@@ -128,6 +142,47 @@ Returns (line . col) or NIL."
                   ;; This is the form we want
                   (return (offset-to-line-col text (min pos (length text)))))
                 (incf form-count))))))
+    (error () nil)))
+
+(defun navigate-source-path (text form-idx sub-indices)
+  "Find the precise source position indicated by FORM-IDX and SUB-INDICES.
+First locates the FORM-IDX-th top-level form, then descends into sub-forms
+following each index in SUB-INDICES.
+Returns (line . col) or NIL."
+  (handler-case
+      (with-input-from-string (stream text)
+        ;; Advance to the Nth top-level form
+        (let ((form-start nil))
+          (dotimes (i (1+ form-idx))
+            (skip-whitespace-and-comments stream)
+            (let ((pos (file-position stream)))
+              (let ((form (read stream nil :eof)))
+                (when (eq form :eof) (return-from navigate-source-path nil))
+                (when (= i form-idx)
+                  (setf form-start pos)))))
+          ;; If no sub-indices, return the top-level form start
+          (when (or (null sub-indices) (null form-start))
+            (return-from navigate-source-path
+              (when form-start (offset-to-line-col text (min form-start (length text))))))
+          ;; Re-read from form-start with source positions
+          (file-position stream form-start)
+          (let ((form (read stream nil :eof)))
+            (when (eq form :eof) (return-from navigate-source-path nil))
+            ;; Navigate into sub-forms following the index path
+            (let ((current form))
+              (dolist (idx sub-indices)
+                (unless (and (listp current) (integerp idx) (< idx (length current)))
+                  (return-from navigate-source-path
+                    (offset-to-line-col text (min form-start (length text)))))
+                (setf current (nth idx current)))
+              ;; Now find the position of CURRENT within the top-level form text
+              (let* ((form-text (subseq text form-start
+                                        (min (file-position stream) (length text))))
+                     (target (string-downcase (princ-to-string current)))
+                     (rel-pos (search target (string-downcase form-text))))
+                (if rel-pos
+                    (offset-to-line-col text (+ form-start rel-pos))
+                    (offset-to-line-col text (min form-start (length text)))))))))
     (error () nil)))
 
 (defun extract-position-from-condition (condition text)
@@ -187,24 +242,81 @@ Returns (line . col) or NIL."
        (declare (ignore match))
        (when groups (aref groups 0))))))
 
+(defun position-in-comment-or-string-p (text offset)
+  "Return T if OFFSET in TEXT falls inside a line comment, block comment, or string literal.
+Scans from the beginning of TEXT, tracking reader state."
+  (let ((i 0)
+        (len (length text))
+        (in-string nil)
+        (escape nil))
+    (loop while (< i offset)
+          do (let ((c (char text i)))
+               (cond
+                 ;; Inside a string: only escape and closing quote matter
+                 (in-string
+                  (cond
+                    (escape (setf escape nil))
+                    ((char= c #\\) (setf escape t))
+                    ((char= c #\") (setf in-string nil))))
+                 ;; Block comment: #| ... |#  (nestable)
+                 ((and (char= c #\#)
+                       (< (1+ i) len)
+                       (char= (char text (1+ i)) #\|))
+                  (incf i 2) ; consume #|
+                  (let ((depth 1))
+                    (loop while (and (< i offset) (> depth 0))
+                          do (cond
+                               ((and (char= (char text i) #\#)
+                                     (< (1+ i) len)
+                                     (char= (char text (1+ i)) #\|))
+                                (incf depth) (incf i 2))
+                               ((and (char= (char text i) #\|)
+                                     (< (1+ i) len)
+                                     (char= (char text (1+ i)) #\#))
+                                (decf depth) (incf i 2))
+                               (t (incf i))))
+                    ;; If we hit OFFSET while still inside the block comment, it's a comment
+                    (when (> depth 0) (return-from position-in-comment-or-string-p t)))
+                  (decf i)) ; loop will incf below
+                 ;; Line comment: ; ... \n
+                 ((char= c #\;)
+                  ;; Everything from here to end-of-line is a comment;
+                  ;; if offset is in this range, it's inside a comment
+                  (let ((eol (or (position #\Newline text :start i) len)))
+                    (when (< offset eol)
+                      (return-from position-in-comment-or-string-p t))
+                    ;; Skip to the newline
+                    (setf i eol)
+                    (decf i))) ; loop will incf below
+                 ;; String open
+                 ((char= c #\") (setf in-string t))))
+             (incf i))
+    ;; If we ended inside a string literal, the offset is inside it
+    in-string))
+
 (defun find-symbol-position-in-text (text symbol-name)
-  "Find the best occurrence of SYMBOL-NAME in TEXT.
-Prefers occurrences in code (not comments). Returns (line . col) or NIL."
+  "Find the first occurrence of SYMBOL-NAME in TEXT that is in code (not a
+comment or string) and is a whole-symbol match (word boundaries).
+Returns (line . col) or NIL."
   (when (and text symbol-name (> (length symbol-name) 0))
     (let* ((downcased (string-downcase text))
-           (target (string-downcase symbol-name)))
-      ;; Search for the symbol, skipping comment lines
-      (let ((pos 0))
-        (loop
-          (let ((found (search target downcased :start2 pos)))
-            (unless found (return nil))
-            ;; Check if this occurrence is inside a comment
-            (let ((line-start (or (position #\Newline text :end found :from-end t) -1)))
-              (let ((before-on-line (subseq text (1+ line-start) found)))
-                (unless (search ";" before-on-line)
-                  ;; Not in a comment - return this position
-                  (return (offset-to-line-col text found)))))
-            (setf pos (1+ found))))))))
+           (target (string-downcase symbol-name))
+           (tlen (length target))
+           (tlen-text (length text))
+           (pos 0))
+      (loop
+        (let ((found (search target downcased :start2 pos)))
+          (unless found (return nil))
+          ;; Word-boundary check: chars immediately outside the match must not
+          ;; be symbol constituents.
+          (let ((left-ok  (or (zerop found)
+                              (not (symbol-char-p (char text (1- found))))))
+                (right-ok (or (>= (+ found tlen) tlen-text)
+                              (not (symbol-char-p (char text (+ found tlen)))))))
+            (when (and left-ok right-ok
+                       (not (position-in-comment-or-string-p text found)))
+              (return (offset-to-line-col text found))))
+          (setf pos (1+ found)))))))
 
 (defvar *diagnostics-temp-file*
   (merge-pathnames "sextant-diag.lisp" (uiop:temporary-directory))
@@ -271,28 +383,35 @@ Returns a list of captured-condition structs."
                   (lambda (c)
                     (let ((msg (princ-to-string c)))
                       (unless (noise-warning-p msg)
-                        (let* ((sym (extract-symbol-from-warning c))
-                               (sym-pos (when sym
-                                          (find-symbol-position-in-text text sym)))
-                               (ctx-pos (extract-position-from-condition c text)))
+                        (let* ((sym     (extract-symbol-from-warning c))
+                               ;; Best: symbol search with word-boundary + comment/string awareness
+                               (sym-pos (when sym (find-symbol-position-in-text text sym)))
+                               ;; Fallback: SBCL source-path (imprecise for style warnings)
+                               (sp-pos  (when (null sym-pos)
+                                          (extract-source-path-position text)))
+                               ;; Rough fallback: enclosing form boundary
+                               (ctx-pos (when (and (null sym-pos) (null sp-pos))
+                                          (extract-position-from-condition c text))))
                           (push (make-captured-condition
                                  :message msg
                                  :severity (condition-severity c)
-                                 ;; Prefer symbol-level position over form-level
-                                 :position (or sym-pos ctx-pos)
+                                 :position (or sym-pos sp-pos ctx-pos)
                                  :source-form sym)
                                 conditions))))
                     (muffle-warning c)))
                 (error
                   (lambda (c)
-                    (let ((msg (princ-to-string c)))
+                    (let* ((msg     (princ-to-string c))
+                           (sym     (extract-symbol-from-warning c))
+                           (sym-pos (when sym (find-symbol-position-in-text text sym)))
+                           (sp-pos  (when (null sym-pos)
+                                      (extract-source-path-position text)))
+                           (ctx-pos (when (and (null sym-pos) (null sp-pos))
+                                      (extract-position-from-condition c text))))
                       (push (make-captured-condition
                              :message msg
                              :severity +severity-error+
-                             :position (or (extract-position-from-condition c text)
-                                           (let ((sym (extract-symbol-from-warning c)))
-                                             (when sym
-                                               (find-symbol-position-in-text text sym)))))
+                             :position (or sym-pos sp-pos ctx-pos))
                             conditions))
                     ;; Return what we have so far
                     (return-from compile-buffer-for-diagnostics
