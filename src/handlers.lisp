@@ -181,7 +181,7 @@
          (line (json-get pos "line"))
          (col (json-get pos "character"))
          (text (document-text uri))
-         (empty (make-json-object "isIncomplete" :true "items" (list))))
+         (empty (make-json-object "isIncomplete" t "items" (list))))
     (if (not text)
         empty
         (let ((prefix (symbol-at-position text line col)))
