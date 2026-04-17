@@ -197,16 +197,10 @@
                    "items" (mapcar
                             (lambda (c)
                               (destructuring-bind (name kind pkg) c
-                                (let ((doc (symbol-hover-info name)))
-                                  (apply #'make-json-object
-                                         `("label" ,name
-                                           "kind" ,kind
-                                           "detail" ,(format nil "~(~a~)" pkg)
-                                           ,@(when doc
-                                               (list "documentation"
-                                                     (make-json-object
-                                                      "kind" "markdown"
-                                                      "value" doc))))))))
+                                (make-json-object
+                                 "label" name
+                                 "kind" kind
+                                 "detail" (format nil "~(~a~)" pkg))))
                             completions)))))))))
 
 ;;; --- Go to Definition ---

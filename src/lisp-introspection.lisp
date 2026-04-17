@@ -34,7 +34,7 @@ Returns (values symbol package) or NIL."
         (when (eq status :external)
           (return-from find-symbol-in-packages (values sym pkg)))))))
 
-(defparameter *hover-max-width* 72
+(defvar *hover-max-width* 72
   "Soft maximum line width for hover documentation output.")
 
 (defun format-arglist (sym-name arglist &optional (max-width *hover-max-width*))
@@ -49,7 +49,7 @@ Each argument goes on its own line when the single-line form exceeds MAX-WIDTH."
         (with-output-to-string (s)
           (write-char #\( s)
           (write-string name-str s)
-          (loop for (arg . rest) on arg-strs
+          (loop for arg in arg-strs
                 do (write-char #\Newline s)
                    (write-string indent s)
                    (write-string arg s))
