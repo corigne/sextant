@@ -107,11 +107,11 @@ and strip leading/trailing blank lines from the result."
                                    (sb-introspect:function-lambda-list sym)
                                  (error () nil))))
                  (when arglist
-                   (format s "~%```lisp~%~a~%```~%"
+                   (format s "```lisp~%~a~%```~%"
                            (format-arglist (symbol-name sym) arglist))))))
             ((boundp sym)
              (format s " - *Variable*~%")
-             (format s "~%`~s`~%" (symbol-value sym)))
+             (format s "`~s`~%" (symbol-value sym)))
             ((find-class sym nil)
              (format s " - *Class*~%"))
             (t
