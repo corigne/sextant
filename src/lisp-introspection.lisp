@@ -123,7 +123,7 @@ and strip leading/trailing blank lines from the result."
                          (documentation sym 'structure)
                          (documentation sym 'setf))))
             (when doc
-              (format s "~%~a" (clean-docstring doc)))))))))
+              (format s "---~%~a" (clean-docstring doc)))))))))
 
 (defun symbol-completions (prefix &optional (limit 50))
   "Return a list of completion candidates matching PREFIX.
