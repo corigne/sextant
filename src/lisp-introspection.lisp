@@ -34,6 +34,27 @@ Returns (values symbol package) or NIL."
         (when (eq status :external)
           (return-from find-symbol-in-packages (values sym pkg)))))))
 
+(defparameter *hover-max-width* 72
+  "Soft maximum line width for hover documentation output.")
+
+(defun format-arglist (sym-name arglist &optional (max-width *hover-max-width*))
+  "Format SYM-NAME and ARGLIST as a lambda-list string, wrapping long lines.
+Each argument goes on its own line when the single-line form exceeds MAX-WIDTH."
+  (let* ((name-str (string-downcase sym-name))
+         (arg-strs (mapcar (lambda (a) (string-downcase (format nil "~s" a))) arglist))
+         (single-line (format nil "(~a~{~^ ~a~})" name-str arg-strs))
+         (indent (make-string (+ 2 (length name-str)) :initial-element #\Space)))
+    (if (<= (length single-line) max-width)
+        single-line
+        (with-output-to-string (s)
+          (write-char #\( s)
+          (write-string name-str s)
+          (loop for (arg . rest) on arg-strs
+                do (write-char #\Newline s)
+                   (write-string indent s)
+                   (write-string arg s))
+          (write-char #\) s)))))
+
 (defun clean-docstring (doc)
   "Trim trailing whitespace from each line, collapse multiple blank lines,
 and strip leading/trailing blank lines from the result."
@@ -86,9 +107,8 @@ and strip leading/trailing blank lines from the result."
                                    (sb-introspect:function-lambda-list sym)
                                  (error () nil))))
                  (when arglist
-                   (format s "~%```lisp~%(~(~a~)~{ ~(~a~)~})~%```~%"
-                           (string-downcase (symbol-name sym))
-                           arglist)))))
+                   (format s "~%```lisp~%~a~%```~%"
+                           (format-arglist (symbol-name sym) arglist))))))
             ((boundp sym)
              (format s " - *Variable*~%")
              (format s "~%`~s`~%" (symbol-value sym)))
